@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 ALLOWED = {'PHOENIX_BASE_URL', 'PHOENIX_API_KEY', 'AIRFLOW_CONN_JUDGE',
-           'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL'}
+           'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL', 'AIRFLOW_CONN_TEXT2SQL_API'}
 
 
 def main():

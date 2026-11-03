@@ -43,7 +43,7 @@ def test_runtime_env_only_forwards_allowlisted_keys(tmp_path, monkeypatch):
     monkeypatch.setattr('sys.argv', ['write_runtime_env', '--source', str(source), '--output', str(output)])
     write_runtime_env.main()
     values = dotenv_values(output, interpolate=False)
-    assert set(values) == write_runtime_env.ALLOWED - {'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL'}
+    assert set(values) == write_runtime_env.ALLOWED - {'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL', 'AIRFLOW_CONN_TEXT2SQL_API'}
     assert values['AIRFLOW_CONN_JUDGE'] == 'abc$123'
     assert 'never-forward' not in output.read_text()
     assert output.stat().st_mode & 0o777 == 0o600

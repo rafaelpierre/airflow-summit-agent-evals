@@ -184,10 +184,10 @@ def test_agent_never_receives_golden_and_errors_are_redacted(monkeypatch):
     payloads = []
     def handler(request):
         payloads.append(json.loads(request.content))
-        return httpx.Response(200, json={'sql': 'select 1'})
+        return httpx.Response(200, json={'generated_sql': 'select 1'})
     out = call_agent('exp', normalize(RAW)[0], 'baseline', httpx.Client(transport=httpx.MockTransport(handler)))
     assert out['status'] == 'ok' and out['latency_origin'] == 'client'
-    assert set(payloads[0]) == {'question', 'request_id'}
+    assert set(payloads[0]) == {'question', 'narrate', 'verbose'}
     assert 'reference_sql' not in payloads[0]
     def bad(request):
         return httpx.Response(500, text='secret-test-value')

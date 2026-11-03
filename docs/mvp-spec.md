@@ -2,15 +2,12 @@
 
 ## Current scope
 
-The workshop separates application execution from evaluation:
+The workflow supports two explicit inputs:
 
-1. Run the existing `agentic-text2sql` application through a host-side CLI.
-2. Save its candidate SQL, actual trace IDs, and errors as Phoenix experiment runs.
-3. Trigger one local Airflow DAG with the saved output experiment ID.
-4. Airflow fetches the pinned golden dataset and existing outputs, runs mapped LLM judgments, persists annotations, and reports completeness.
-5. Codex assists diagnosis and repair outside the DAG. Run the repaired application separately, then evaluate its saved candidate outputs under compatible conditions.
+1. Dataset/version IDs: create a Phoenix experiment, call the separately hosted `agentic-text2sql` HTTP API for each selected golden row, persist outputs, then judge them.
+2. An existing experiment ID: evaluate saved outputs with zero application requests.
 
-Airflow must not call a REST endpoint, spawn the application CLI, deploy the application, or generate missing candidate outputs. Application traces alone are not experiment outputs. No REST server is required. This scope supersedes the earlier application-execution DAG design.
+The API execution stage supersedes the former judge-only restriction at the user's request. Airflow does not spawn or deploy the application. Codex diagnosis and repair stay outside the DAG. The optional host CLI remains supported.
 
 ## Runtime and source repositories
 
@@ -42,12 +39,14 @@ Import golden data if absent, and record local dataset/version IDs. Old IDs and 
 
 The DAG takes:
 
-- `experiment_id`: required ID of an existing output experiment, not an evaluation ledger.
+- `experiment_id`: existing output experiment for evaluation-only mode, not an evaluation ledger.
+- Otherwise `dataset_id` and `dataset_version_id`: required pinned inputs for a new API experiment.
+- `max_examples`: optional initial sample; absent means all rows, up to the 1024 mapped-task limit.
 - `evaluation_config_id`: optional saved configuration selector.
 - `new_evaluation_config`: explicit request to snapshot current Airflow settings.
 - `baseline_experiment_id` and `baseline_evaluation_config_id`: optional comparison selectors.
 
-Reject application execution/selection parameters in this DAG. Infer dataset/version and selected identities from the saved experiment. Fetch the exact pinned golden dataset, normalize and validate the selected examples, and confirm saved context matches. Do not join on question text or position.
+Reject dataset selection parameters when an existing experiment ID is supplied. Infer dataset/version and selected identities from the saved experiment in evaluation-only mode. Fetch the exact pinned golden dataset, normalize and validate the selected examples, and confirm saved context matches. Do not join on question text or position.
 
 Golden examples contain `example_id`, `question`, `reference_sql`, `schema_context`, `sql_dialect`, optional `business_rules`, and optional `split`. The default Phoenix paths are `input.question`, `output.sql`, and metadata fields for context/dialect/rules/split.
 
@@ -61,18 +60,19 @@ Environment-backed Airflow secrets (`AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL`, `AIRFLOW
 
 Resolve the model and rubric once for a new evaluation configuration, validate supported settings, and snapshot the complete effective configuration, canonical SHA-256 hash, model identifier, context, and schema/evaluator versions. Recover that snapshot on retry without rereading current Variables. Reuse a unique saved configuration by default; require an explicit selector if ambiguous. Deliberate changes create a distinct configuration and preserve prior annotations. Temperature zero does not guarantee deterministic judging.
 
-The current judge uses the OpenAI provider. Reject unexpected returned model identifiers; do not silently combine model aliases/fallbacks. Do not fabricate costs, scores, or successful checks.
+The judge uses the OpenAI-compatible protocol, including Modal endpoints configured through the `judge` Connection Host (`/v1` base URL) and Password (bearer key or combined Modal proxy token). The endpoint must support structured tool-call output. New snapshots record `model_api=openai-chat` and evaluator version 2; legacy snapshots retain their prior API selection. Reject unexpected returned model identifiers; do not silently combine model aliases/fallbacks. Do not fabricate costs, scores, or successful checks.
 
 ## DAG and persistence
 
 Flow:
 
 ```text
-prepare_run -> prepare_judge_inputs -> [judge_sql -> persist_evaluation] mapped
+prepare_run -> prepare_experiment_inputs -> [run_experiment] mapped
+            -> prepare_judge_inputs -> [judge_sql -> persist_evaluation] mapped
                                    -> consolidate -> check_completeness
 ```
 
-Use `schedule=None`, `catchup=False`, one active DAG run, and bounded task concurrency (2). Preparation creates or recovers an immutable evaluation ledger linking the output experiment; the pinned client has no public experiment metadata-update API. Keep compact identifiers in XCom; durable data lives in Phoenix.
+Use `schedule=None`, `catchup=False`, one active DAG run, and bounded task concurrency (2). Preparation creates or recovers an output experiment for API generation, or an immutable evaluation ledger linking saved outputs; the pinned client has no public experiment metadata-update API. Keep compact identifiers in XCom; durable data lives in Phoenix.
 
 Prefer the mapped Common AI `LLMOperator`; document a Python-task fallback only if compatibility requires it. Carry explicit experiment-run IDs outside model-generated output. Treat SQL/comments/example content as untrusted data, not judge instructions. Supply both SQL queries, question, schema, dialect, and business rules from the frozen context.
 
@@ -90,4 +90,12 @@ Export from Phoenix on the host; never assume workers share or preserve local re
 
 Use `make setup`, `make test`, `make up`, and `make parse` for the evaluation stack. Use `make agent-setup`, `make agent-check`, and `make agent-test` separately on the host. Keep README commands accurate.
 
-Test pinned-dataset reads, saved-output normalization, configuration snapshots/retries, explicit run-ID association, zero application execution from the DAG, partial reports, baseline compatibility, HTML escaping, and OpenInference span conversion. Live checks require configured services. Use explicit test doubles; never silently substitute them in production. Distinguish offline, local synthetic, and real model verification. Finish with implemented changes, validation results, and missing configuration.
+Test pinned-dataset reads, saved-output normalization, configuration snapshots/retries, explicit run-ID association, API payload isolation and zero application execution during re-evaluation, partial reports, baseline compatibility, HTML escaping, and OpenInference span conversion. Live checks require configured services. Use explicit test doubles; never silently substitute them in production. Distinguish offline, local synthetic, and real model verification. Finish with implemented changes, validation results, and missing configuration.
+
+## API Experiment stage
+
+Use Airflow Connection `text2sql_api` with the full `/ask` URL in Host and an optional proxy bearer token in Password; environment-backed `AIRFLOW_CONN_TEXT2SQL_API` is allowlisted. Resolve the Connection only inside execution tasks. Keep application model credentials in the separately hosted application.
+
+Send `question`, `narrate=false`, and `verbose=false`; never send reference SQL or context labels. Validate `generated_sql` and the optional `X-Trace-ID` header, and record measured latency. No source revision is returned, so do not invent one. Sanitize API errors; do not persist raw error bodies. A 502 or pipeline error is an application failure, distinct from an incorrect SQL judgment.
+
+Run one mapped task per selected row with bounded concurrency and a 60-second HTTP timeout. Resume skips every persisted result, including errors; deliberately rerunning the application requires a new experiment. A crash before persistence can repeat a request because `/ask` has no idempotency support. Request-ID headers are correlation only. Judge available successful outputs even after partial generation failure, consolidate persisted results, and preserve incomplete status.

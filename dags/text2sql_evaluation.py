@@ -7,7 +7,11 @@ from include.text2sql_eval.judge import SQLJudgeOperator
 @dag(schedule=None, catchup=False, max_active_runs=1, max_active_tasks=2,
      default_args={'retries': 1, 'retry_delay': timedelta(seconds=30), 'execution_timeout': timedelta(minutes=20)},
      params={
-         'experiment_id': Param('', type='string'),
+         'experiment_id': Param(None, type=['null', 'string'],
+                                description='Optional: existing Phoenix experiment to re-evaluate. Leave empty for a new experiment.'),
+         'dataset_id': Param(None, type=['null', 'string']),
+         'dataset_version_id': Param(None, type=['null', 'string']),
+         'max_examples': Param(None, type=['null', 'integer'], minimum=1, maximum=1024),
          'evaluation_config_id': Param(None, type=['null', 'string']),
          'new_evaluation_config': Param(False, type='boolean'),
          'baseline_experiment_id': Param(None, type=['null', 'string']),
@@ -17,13 +21,26 @@ def text2sql_evaluation():
     @task
     def prepare_run():
         from include.text2sql_eval.phoenix_adapter import PhoenixStore
-        from include.text2sql_eval.workflow import prepare_evaluation
+        from include.text2sql_eval.experiment import prepare_experiment
         c = get_current_context()
-        return prepare_evaluation(PhoenixStore(), c['params'], [c['dag'].dag_id, c['run_id']],
+        return prepare_experiment(PhoenixStore(), c['params'], [c['dag'].dag_id, c['run_id']],
             lambda: Variable.get('text2sql_judge_config', deserialize_json=True),
             lambda: Variable.get('text2sql_judge_model'))
 
     @task
+    def prepare_experiment_inputs(ref):
+        from include.text2sql_eval.phoenix_adapter import PhoenixStore
+        from include.text2sql_eval.experiment import experiment_refs
+        return experiment_refs(PhoenixStore(), ref)
+
+    @task(execution_timeout=timedelta(minutes=3))
+    def run_experiment(ref):
+        from include.text2sql_eval.phoenix_adapter import PhoenixStore
+        from include.text2sql_eval.experiment import run_example
+        from include.text2sql_eval.agent_api import call_configured_agent
+        run_example(PhoenixStore(), ref, call_configured_agent)
+
+    @task(trigger_rule='all_done')
     def prepare_judge_inputs(ref):
         from include.text2sql_eval.phoenix_adapter import PhoenixStore
         from include.text2sql_eval.workflow import judge_refs
@@ -60,7 +77,9 @@ def text2sql_evaluation():
             raise ValueError('Evaluation is incomplete; inspect saved Phoenix results and export the report')
 
     ref = prepare_run()
+    experiments = run_experiment.expand(ref=prepare_experiment_inputs(ref))
     inputs = prepare_judge_inputs(ref)
+    experiments >> inputs
     judgments = evaluate.expand(ref=inputs)
     report = consolidate(ref)
     judgments >> report

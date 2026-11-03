@@ -18,8 +18,11 @@ def test_dag_parses_maps_and_serializes_without_external_access(monkeypatch):
     assert type(judge.task_group).__name__ == 'MappedTaskGroup'
     assert dag.get_task('consolidate').trigger_rule == 'all_done'
     assert dag.get_task('check_completeness').trigger_rule == 'all_success'
-    assert 'run_experiment' not in dag.task_ids
-    assert dag.get_task('prepare_judge_inputs').upstream_task_ids == {'prepare_run'}
-    assert set(dag.params) == {'experiment_id', 'evaluation_config_id', 'new_evaluation_config',
+    assert dag.get_task('run_experiment').is_mapped
+    assert dag.get_task('prepare_judge_inputs').upstream_task_ids == {'prepare_run', 'run_experiment'}
+    assert set(dag.params) == {'dataset_id', 'dataset_version_id', 'max_examples', 'experiment_id', 'evaluation_config_id', 'new_evaluation_config',
                                'baseline_experiment_id', 'baseline_evaluation_config_id'}
+    experiment_param = dag.params.get_param('experiment_id')
+    assert 'null' in experiment_param.schema['type']
+    assert experiment_param.resolve(None) is None
     DagSerialization.to_dict(dag)

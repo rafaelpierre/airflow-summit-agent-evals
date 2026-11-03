@@ -1,42 +1,186 @@
 # Text2SQL evaluation flywheel
 
-Judge saved Text2SQL experiment outputs with one manually triggered Airflow DAG. Run the application separately through its CLI. Phoenix stores versioned datasets, application outputs, configuration snapshots, and judgments; a shared renderer produces HTML and repair packets. Application repair stays outside the DAG.
+Generate and judge Text2SQL experiment outputs with one manually triggered Airflow DAG. The Experiment stage calls the separately hosted application API for each golden dataset row; evaluation-only runs can reuse saved outputs. Phoenix stores versioned datasets, application outputs, configuration snapshots, and judgments; a shared renderer produces HTML and repair packets. Application repair stays outside the DAG.
 
-## Quick start
+## Setup: first successful API experiment
 
-With uv and the Colima Docker engine available:
+Run the commands below from this repository's root unless a step says otherwise. You need uv, Docker CLI with Compose v2, Colima, and access to the application and judge model endpoints. The application and judge can use different Modal endpoints/models.
+
+### 1. Start Airflow and Phoenix
+
+Start your existing Colima VM, or create one with sufficient memory:
 
 ```sh
-make setup     # install locked dependencies and prepare local credentials
-make up        # build and start Airflow and Phoenix
-make status    # check running services
-make down      # stop services while preserving database volumes
+colima start --cpu 4 --memory 8
+make setup
+make up
+make parse
+make status
 ```
+
+If Colima is already running, reuse it; changing VM resources can require a stop/start. `make setup` installs locked dependencies and creates persistent local credentials. `make up` builds the Airflow image, starts Phoenix, initializes Airflow, and waits for service health. These commands do not trigger model calls. Do not run `make down` until you want to stop the stack.
 
 | Service | Local URL | Login |
 | --- | --- | --- |
-| Airflow | [localhost:8080](http://localhost:8080) | Username `admin`; read `AIRFLOW_ADMIN_PASSWORD` in the gitignored `.env.airflow` file |
+| Airflow | [localhost:8080](http://localhost:8080) | Username `admin`; read `AIRFLOW_ADMIN_PASSWORD` privately in the gitignored `.env.airflow` file |
 | Phoenix | [localhost:6006](http://localhost:6006) | No login for this loopback-only local setup |
 
-Dependencies are managed with **uv**, using `pyproject.toml` and `uv.lock`; the two requirements files have been removed. Local verification on 2026-11-03 passed **26 offline evaluation tests** and **2 offline instrumentation tests**, DAG parsing, service health/login checks, and Phoenix persistence across container recreation.
+Keep `.env.airflow` and the Docker volumes across restarts. The DAG is initially paused. `make verify` checks startup health and expects it to still be paused; use it before unpausing your first run.
 
-The evaluation DAG remains paused after setup. No agent or model calls were made during validation. See [Local checks and startup](#local-checks-and-startup) for prerequisites and verification commands.
+### 2. Prepare the application and golden dataset
+
+If `apps/agentic-text2sql` is absent, clone it once:
+
+```sh
+git clone --depth 1 https://github.com/rafaelpierre/agentic-text2sql.git apps/agentic-text2sql
+```
+
+Use a revision containing `text2sql_mvp/app/api.py` and its tracing support. Preserve an existing checkout and its local changes. Initialize the workshop database and download NLTK data:
+
+```sh
+make agent-setup
+make agent-check
+```
+
+Create `.env.agent` from `.env.agent.example` only if it does not exist. Edit it privately with the application's `MODAL_API_TOKEN` (combined proxy token), `FAST_MODEL_BASE_URL`, `SQL_MODEL_BASE_URL`, and any required `FAST_MODEL`/`SQL_MODEL` overrides. Both model base URLs include `/v1`. These are application credentials; the judge is configured separately in step 4.
+
+Export and import the golden examples once, reusing the existing dataset if present:
+
+```sh
+uv run --locked --project workshop_agent python workshop_agent/cli.py export-dataset > outputs/agent-golden.json
+PHOENIX_BASE_URL=http://localhost:6006 uv run --locked python scripts/import_dataset.py \
+  --name agentic-text2sql-golden --file outputs/agent-golden.json
+```
+
+Open `outputs/dataset-import.json` and retain its `dataset_id` and `dataset_version_id`. Use the IDs from your instance, not IDs copied from another installation. If the dataset is already imported and those IDs are available, skip this import.
+
+### 3. Start the application API
+
+In a separate terminal, start from this repository's root. The following command explicitly reuses the workshop database and NLTK files created above and loads `.env.agent`:
+
+```sh
+EVAL_PROJECT_ROOT="$PWD"
+(
+  cd apps/agentic-text2sql
+  DB_URL="sqlite:///$EVAL_PROJECT_ROOT/outputs/agent/text2sql.db" \
+  NLTK_DATA="$EVAL_PROJECT_ROOT/outputs/nltk_data" \
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:6006/v1/traces \
+  TEXT2SQL_TRACING=true \
+  uv run --locked --extra tracing --env-file "$EVAL_PROJECT_ROOT/.env.agent" \
+    uvicorn text2sql_mvp.app.api:app --host 0.0.0.0 --port 8000
+)
+```
+
+Leave this terminal running. If you already have a configured API and database, keep using them and use their reachable URL in step 4. The upstream API does not automatically use the workshop wrapper's database paths; explicit paths avoid accidentally opening an empty database. Its own `.env` is also loaded, but explicit environment settings take precedence.
+
+`0.0.0.0` allows the Colima containers to reach the host API. This application has no authentication middleware, so use a trusted local/private network. The API docs are at [localhost:8000/docs](http://localhost:8000/docs). Check liveness from an Airflow container without making an inference call:
+
+```sh
+docker compose --env-file .env.airflow -f compose.airflow.yaml exec -T airflow-scheduler \
+  python -c "import httpx; r=httpx.get('http://host.lima.internal:8000/health', timeout=10); r.raise_for_status(); print(r.json())"
+```
+
+Expect `{"status":"ok"}`. The Colima route is `host.lima.internal`; `localhost` inside Airflow refers to the Airflow container. If your engine uses another host route, verify it and use it consistently. A health check verifies connectivity, not model credentials or inference.
+
+### 4. Configure the two Airflow Connections and judge Variables
+
+Log into Airflow and open **Admin → Connections → Add Connection**. Save these two Connections:
+
+| Field | Application Connection | Judge Connection (Modal) |
+| --- | --- | --- |
+| Connection ID | `text2sql_api` | `judge` |
+| Connection type | HTTP (`http`) | Pydantic AI (`pydanticai`) |
+| Host | `http://host.lima.internal:8000/ask` | `https://YOUR-ENDPOINT.modal.run/v1` |
+| Password | Empty for the local API; bearer token only if your proxy requires it | Endpoint bearer API key, or combined Modal proxy token `TOKEN_ID.TOKEN_SECRET` |
+| Login, Schema/Model, Port, Extra | Leave empty | Leave empty; the model is selected by the Variable below |
+
+Use the **full URL** in Host. The application URL ends in `/ask`; the judge URL ends in `/v1`, without `/chat/completions`. The judge speaks the OpenAI-compatible Chat Completions protocol; it does not require an OpenAI-hosted model or a Modal-specific Airflow provider. The Modal server must support tool calls for structured judgments.
+
+The pinned HTTP provider **6.3.0** supplies the HTTP option, and Common AI **1.0.0** supplies Pydantic AI. If either is missing from the menu, run `make setup` followed by `make up` to rebuild/recreate the containers, then refresh the browser. Installing a package only in the host virtual environment does not update Airflow's containers.
+
+Import the sample rubric from the repository root:
+
+```sh
+make rubric
+```
+
+Then open **Admin → Variables** and verify both required Variables:
+
+| Key | Value |
+| --- | --- |
+| `text2sql_judge_config` | JSON rubric imported by `make rubric`; includes `rubric_version`, `rubric`, and `temperature` |
+| `text2sql_judge_model` | The exact model ID served by your Modal endpoint, as a plain string with no provider prefix |
+
+**You must create `text2sql_judge_model` yourself.** `make rubric` does not set it. Use the model's exact served ID, without `openai:` or `openai-chat:`. It must match the response's model identifier. Setting a model on the Connection does not replace this Variable. Keep credentials out of Variables.
+
+For Modal proxy authentication, Password contains the proxy token ID and secret joined by a period; see [Modal's bearer authentication format](https://modal.com/docs/guide/webhook-proxy-auth). Do not use a Modal workspace API token. For a custom bearer-authenticated endpoint, use its API key instead.
+
+### 5. Trigger a one-row test
+
+Open **DAGs → text2sql_evaluation**, unpause it, and choose **Trigger DAG**. Fill the dataset fields using `outputs/dataset-import.json`, set `max_examples` to `1`, and leave `experiment_id` empty. The equivalent JSON is:
+
+```json
+{
+  "experiment_id": null,
+  "dataset_id": "YOUR_DATASET_ID",
+  "dataset_version_id": "YOUR_DATASET_VERSION_ID",
+  "max_examples": 1
+}
+```
+
+Leave the baseline and evaluation configuration selectors empty for the first run, and leave `new_evaluation_config` false. `experiment_id` is optional and is used only to re-evaluate an existing experiment. Confirm the trigger; this performs real application and judge inference calls.
+
+Watch the run in Graph/Grid view:
+
+```text
+prepare_run → prepare_experiment_inputs → run_experiment (mapped)
+            → prepare_judge_inputs → evaluate.judge_sql → evaluate.persist_evaluation
+            → consolidate → check_completeness
+```
+
+Inspect failed task logs if a task turns red. `prepare_run` returns the original `experiment_id` in its XCom; use that ID to find the experiment in Phoenix. Successful application outputs receive judge annotations there. An `incorrect` verdict is a valid result and does not by itself fail the DAG. API/evaluator failures and missing results make the final completeness task fail.
+
+After the one-row test succeeds, trigger a new run with `max_examples` empty/null to process the full dataset, up to 1024 rows. A new dataset-triggered run creates a new experiment and calls the API again. See [Run, diagnose, compare](#run-diagnose-compare) for re-evaluation without application calls and report export.
+
+### 6. Recover from configuration mistakes
+
+| Symptom | Fix |
+| --- | --- |
+| `VARIABLE_NOT_FOUND: text2sql_judge_model` | Add the exact Variable in step 4, save it, then clear the failed `prepare_run` task to retry. No experiment snapshot was created by this failure. |
+| Missing `text2sql_judge_config` | Run `make rubric`, then retry `prepare_run`. This command overwrites that Variable with the example rubric, so preserve an intentional custom rubric first. |
+| `experiment_id` appears mandatory | Refresh the trigger page after the DAG processor loads the current DAG. `make parse` verifies the file imports. New experiments accept an empty field or JSON `null`. |
+| HTTP/Pydantic AI absent from connection types | Rebuild with `make up` after installing the locked dependencies; refresh the UI. |
+| API connection refused or timeout | Keep the API terminal running, verify the container-side `/health` command, and check the bind interface and host route. |
+| Judge authentication failure | Verify the `judge` Host and Password. Modal proxy credentials use the combined proxy token, not a workspace API token. |
+| `model_identity_mismatch` | Use the exact model ID returned by the endpoint. For an already saved configuration, create a new evaluation configuration rather than expecting a Variable edit to change it. |
+| Judge requests `/responses` against a Chat Completions endpoint | Current new snapshots explicitly select `openai-chat`. For a legacy saved experiment, trigger re-evaluation with `new_evaluation_config: true`. |
+| “Skipping masking for a secret as it's too short” | This warning is separate from a missing Variable. Follow the actual task exception; do not paste credentials into logs or chat. |
+
+Once preparation has succeeded, the saved rubric/model configuration is immutable for retries. To change it deliberately, use the existing output experiment ID with `new_evaluation_config: true`. API results, including saved API failures, survive task clearing; to repeat application requests, create a new dataset-triggered experiment. Do not repeatedly clear tasks to turn incorrect SQL into a passing answer.
+
+To stop the local infrastructure while retaining data:
+
+```sh
+make down
+```
+
+Stop the separate API terminal with Ctrl-C. Do not use volume deletion flags.
 
 ## Deployment and status
 
 Airflow runs locally with **Docker Compose / LocalExecutor**, using **Airflow 3.3.2 / Python 3.13** and uv-locked dependencies. Colima supplies the Docker engine on macOS. PostgreSQL stores Airflow metadata; Phoenix remains a separate SQLite-backed Compose service.
 
-Implemented: a judge-only DAG with mapped Common AI judging, durable configuration snapshots, retry/resume, baseline comparison, self-contained reports, and a separate host CLI with OpenInference tracing. Airflow never executes the application.
+Implemented: mapped HTTP Experiment tasks followed by Common AI judging, durable configuration snapshots, retry/resume, baseline comparison, self-contained reports, and an optional host CLI with OpenInference tracing. The application API runs separately; Airflow invokes it over HTTP.
 
 Verified locally on 2026-11-03:
 
-- uv lock/sync and 26 offline evaluation tests, including DAG import, mapping, and serialization.
+- 38 offline tests, including nullable trigger parameters, mapping, configuration snapshots, and Modal-compatible Chat Completions through an explicit HTTP test double.
 - Compose image build, PostgreSQL initialization, API/scheduler/DAG-processor health, and authenticated local login.
-- DAG parsing inside the scheduler; the evaluation DAG is registered and paused.
+- DAG parsing and serialization inside the scheduler; the evaluation DAG is registered.
 - Scheduler-to-Phoenix access through the shared Docker network, with Phoenix client **3.6.0** and server **21.0.0**.
 - Synthetic Phoenix dataset and experiment results survive container recreation with the named volume retained.
 
-Real agent and judge model calls still require credentials. See `docs/validation.md` for current import and tracing checks. Startup and validation make no paid inference calls. See `docs/validation.md` for the exact local checks.
+The user reported a working setup after the HTTP provider, optional experiment ID, judge model Variable, and Chat Completions fixes. The automated checks above use offline/synthetic model responses and do not independently verify that live result. Startup and offline validation make no paid inference calls. `docs/validation.md` retains historical checks from earlier workflow versions.
 
 ## Layout and versions
 
@@ -52,7 +196,7 @@ scripts/                       # import, preflight, export, synthetic verificati
 tests/                         # explicit offline doubles and real Airflow DAG parsing
 ```
 
-Common AI **1.0.0** / Pydantic AI **2.65.0** are compatible with the tested Airflow version. `SQLJudgeOperator` subclasses `LLMOperator`; a mapped task group pairs each judgment with its persistence task. It loads saved inputs after template rendering so SQL is never treated as an Airflow template. No Python-task judge fallback is needed for the tested Airflow version. The container uses the same locked Airflow and provider versions as host tests.
+The HTTP provider **6.3.0** registers the HTTP connection type used by `text2sql_api` in the Airflow UI. Common AI **1.0.0** / Pydantic AI **2.65.0** are compatible with the tested Airflow version. `SQLJudgeOperator` subclasses `LLMOperator`; a mapped task group pairs each judgment with its persistence task. It loads saved inputs after template rendering so SQL is never treated as an Airflow template. No Python-task judge fallback is needed for the tested Airflow version. The container uses the same locked Airflow and provider versions as host tests.
 
 The existing root Python package metadata and `src/` scaffold are preserved. The DAG imports `include/`; it does not depend on that separate CLI package.
 
@@ -72,10 +216,11 @@ This uses `python-dotenv` from the uv `dev` dependency group and never prints va
 | `PHOENIX_API_KEY` | Phoenix API key for authenticated access |
 | `AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL` | Optional environment-backed Airflow Variable for the explicit judge model identifier |
 | `AIRFLOW_CONN_JUDGE` | Optional environment-backed Airflow Connection, type `pydanticai`, with the model API key in its password |
+| `AIRFLOW_CONN_TEXT2SQL_API` | Optional environment-backed HTTP Connection for the application `/ask` endpoint |
 
-Set the nonsecret Airflow Variable `text2sql_judge_model` in the UI, CLI, or a supported secrets backend. The DAG reads it through `Variable.get` inside a task; it does not read `JUDGE_MODEL`. Set `text2sql_judge_config` for rubric and temperature. The `judge` Connection holds API credentials. Environment-backed equivalents above are optional; existing Connections/secrets backends work without `.env` credentials. The operator currently uses the OpenAI provider.
+Set the nonsecret Airflow Variable `text2sql_judge_model` in the UI, CLI, or a supported secrets backend. The DAG reads it through `Variable.get` inside a task; it does not read `JUDGE_MODEL`. Set `text2sql_judge_config` for rubric and temperature. The `judge` Connection holds API credentials. Environment-backed equivalents above are optional; existing Connections/secrets backends work without `.env` credentials. The operator uses the OpenAI-compatible protocol, including Modal-hosted models.
 
-Application Modal credentials belong in the separate gitignored `.env.agent`; they are never forwarded to Airflow. `.env.agent.example` contains empty placeholders.
+Application Modal credentials belong in the separate gitignored `.env.agent`; load it explicitly when starting the API as shown above. They are never forwarded to Airflow. `.env.agent.example` contains empty placeholders.
 
 Example connection **shape only** (set the password privately):
 
@@ -83,7 +228,11 @@ Example connection **shape only** (set the password privately):
 {"conn_type":"pydanticai","password":"REPLACE_PRIVATELY"}
 ```
 
-The operator pins `openai:<text2sql_judge_model>` from the saved snapshot and disables provider fallbacks. A returned model identifier that differs from the snapshot produces an evaluator error rather than silently mixing models. Use a concrete dated model identifier, not a moving alias. The rubric currently supports `temperature`; choose a model supporting it. Unsupported provider settings surface as evaluator errors. Temperature zero does not guarantee deterministic judgment.
+For an **OpenAI-compatible Modal judge**, keep Connection ID `judge` and type `pydanticai` (shown as Pydantic AI in the UI). Set Host to the endpoint's full base URL, for example `https://YOUR-ENDPOINT.modal.run/v1` (not `/chat/completions`). Set Password to its bearer API key. For Modal proxy authentication, use the combined proxy token `TOKEN_ID.TOKEN_SECRET` in Password; [Modal supports this bearer format](https://modal.com/docs/guide/webhook-proxy-auth). Do not use a Modal workspace API token. Leave Login and Extra empty for this setup.
+
+Set Variable `text2sql_judge_model` to the exact served model name, without an `openai:` prefix. It must match the model identifier returned by the endpoint. The server must support Chat Completions tool calls for the structured judgment and the configured temperature; a text-only endpoint is not sufficient. Credentials remain in the Connection. No additional Modal Airflow provider is needed.
+
+New configurations pin `openai-chat:<text2sql_judge_model>` and the Chat Completions API in the saved snapshot and disable provider fallbacks. A returned model identifier that differs from the snapshot produces an evaluator error rather than silently mixing models. Use a stable served model identifier (a dated identifier for OpenAI), not a moving alias. The rubric currently supports `temperature`; choose a model supporting it. Unsupported provider settings surface as evaluator errors. Temperature zero does not guarantee deterministic judgment.
 
 Import `docs/airflow-variables.json` through Airflow's Variables UI, or from a configured Airflow environment:
 
@@ -161,9 +310,9 @@ make agent-setup
 make agent-check
 ```
 
-The initial upstream commit is `d3c34388aef7487a882d260cf290af8115ac4baa`. The clone keeps its own Git remote, is ignored by the parent repository, and is excluded from Airflow's Docker image. The application owns optional OpenInference instrumentation in `text2sql_mvp/app/telemetry.py`. The tracked `workshop_agent/cli.py` wrapper calls its pipeline with narration disabled, adds structured JSON output, and reuses that instrumentation. There is no REST server.
+The initial upstream commit is `d3c34388aef7487a882d260cf290af8115ac4baa`. The clone keeps its own Git remote, is ignored by the parent repository, and is excluded from Airflow's Docker image. The application owns optional OpenInference instrumentation in `text2sql_mvp/app/telemetry.py`. The tracked `workshop_agent/cli.py` wrapper calls its pipeline with narration disabled, adds structured JSON output, and reuses that instrumentation. The application also provides a FastAPI server at `text2sql_mvp.app.api:app`.
 
-The wrapper has a separate uv lock/environment because the application requires SQLAlchemy 2 while Airflow uses SQLAlchemy 1.4. `make agent-setup` downloads NLTK wordnet/stopwords and initializes demo data once under ignored `outputs/agent/`. It does not call models or reseed an initialized database. Keep these SQLite files across baseline/candidate runs. Setup refuses to overwrite partially initialized tables. `make agent-test` runs explicit offline instrumentation tests.
+The wrapper has a separate uv lock/environment to keep application dependencies isolated from the Airflow runtime. `make agent-setup` downloads NLTK wordnet/stopwords and initializes demo data once under ignored `outputs/agent/`. It does not call models or reseed an initialized database. Keep these SQLite files across baseline/candidate runs. Setup refuses to overwrite partially initialized tables. `make agent-test` runs explicit offline instrumentation tests.
 
 Copy `.env.agent.example` to `.env.agent` if absent, then privately configure Modal proxy token, model endpoint URLs, and model names. Empty optional model/endpoint settings use the application defaults. Host tracing defaults to `http://localhost:6006/v1/traces` in project `agentic-text2sql`. An authenticated collector uses `PHOENIX_API_KEY`. The wrapper flushes traces before exiting and returns the real root trace ID.
 
@@ -199,9 +348,9 @@ Instrumentation changes live in the nested application's Git repository and must
 
 ## Saved-output contract
 
-The DAG accepts an existing Phoenix experiment ID. Candidate outputs may be a SQL string or an object with required `sql` and optional `trace_id`, `latency_ms`, and `app_revision`. Traces are separate from experiment outputs; exporting spans alone does not create an evaluable experiment.
+For evaluation-only runs, the DAG accepts an existing Phoenix experiment ID. Candidate outputs may be a SQL string or an object with required `sql` and optional `trace_id`, `latency_ms`, and `app_revision`. Traces are separate from experiment outputs; exporting spans alone does not create an evaluable experiment.
 
-The experiment pins the golden dataset version. Full-dataset native Phoenix experiments are supported; subset experiments must declare `selected_example_ids` metadata so missing outputs remain visible. The host runner supplies its durable manifest automatically. The MVP supports one repetition; duplicate identities or multiple repetitions fail validation. Missing/malformed application outputs remain incomplete and are not regenerated by Airflow.
+The experiment pins the golden dataset version. Full-dataset native Phoenix experiments are supported; subset experiments must declare `selected_example_ids` metadata so missing outputs remain visible. The host runner supplies its durable manifest automatically. The MVP supports one repetition; duplicate identities or multiple repetitions fail validation. Missing/malformed saved outputs remain incomplete during evaluation-only runs. New API experiments generate outputs only for rows without a persisted run.
 
 ## Local checks and startup
 
@@ -249,13 +398,27 @@ Preflight runs inside Airflow and resolves Variables and Connections through its
 
 ## Run, diagnose, compare
 
-First run the application on the host and obtain its saved Phoenix experiment ID. Then trigger `text2sql_evaluation`:
+For a new experiment, start the existing application API separately with its database/model configuration. Configure Airflow Connection **`text2sql_api`** (type `http`): set **Host** to the full worker-reachable URL including `/ask`, and optionally **Password** to an authenticated proxy bearer token. The current application API itself has no authentication middleware. Keep it on a trusted local/private network. With Colima, use a host route such as `http://host.lima.internal:8000/ask` and verify worker connectivity; container `localhost` points to the container. Bind the application to an interface reachable through that route.
+
+An optional environment-backed Connection uses `AIRFLOW_CONN_TEXT2SQL_API` in the gitignored `.env`, then `make setup` and `make up`. Its JSON shape is `{"conn_type":"http","host":"http://host.lima.internal:8000/ask","password":""}`. Keep credentials private. No application model credentials are forwarded to Airflow.
+
+Trigger `text2sql_evaluation` with the IDs recorded in `outputs/dataset-import.json`:
+
+```json
+{"dataset_id":"DATASET_ID","dataset_version_id":"VERSION_ID"}
+```
+
+This processes every row in stable example-ID order. Add `"max_examples": 12` for a small initial check. The workflow supports up to 1024 selected rows per run (the default Airflow mapping limit), with at most two tasks active. Larger datasets require an explicit sample. Each HTTP request has a 60-second timeout and sends only `question`, `narrate: false`, and `verbose: false`. The adapter saves `generated_sql`, measured latency, and the actual `X-Trace-ID` when present; returned rows and narration are not needed for SQL judging. The API does not report a source revision, so it remains unknown.
+
+The rubric/model snapshot is saved before requests begin. Each mapped `run_experiment` task persists its result to Phoenix; the Evaluation group then compares its SQL with the pinned golden SQL using the existing LLM judge. Persisted successes and failures are preserved on task retries. A crash after HTTP execution but before Phoenix persistence may repeat a call: the API does not implement idempotency. A new DAG run with dataset IDs creates a new experiment and calls the API again. Incomplete runs still produce reports and fail the final completeness check.
+
+For evaluation only, supply the existing Phoenix output experiment ID (from `prepare_run` XCom or Phoenix):
 
 ```json
 {"experiment_id":"OUTPUT_EXPERIMENT_ID"}
 ```
 
-The DAG only fetches the pinned golden dataset and saved candidate outputs, maps judge/persistence tasks, and generates a report. It has no application task, endpoint, subprocess, or deployment step. On the first evaluation it snapshots the current Airflow rubric/model Variables. Retries recover that snapshot. Later runs reuse the sole saved configuration; supply `evaluation_config_id` when multiple configurations exist.
+With `experiment_id`, the Experiment stage is skipped and the DAG fetches the pinned golden dataset and saved candidate outputs, maps judge/persistence tasks, and generates a report without API calls. Leave the optional `experiment_id` field empty (JSON `null`) for new experiments. Do not combine an existing experiment ID with dataset selection parameters. On the first evaluation it snapshots the current Airflow rubric/model Variables. Retries recover that snapshot. Later runs reuse the sole saved configuration; supply `evaluation_config_id` when multiple configurations exist.
 
 To deliberately evaluate with updated Airflow settings:
 
@@ -265,12 +428,12 @@ To deliberately evaluate with updated Airflow settings:
 
 Configuration hashes include rubric, model, context, and schema/evaluator versions. Prior annotations remain under their hash-qualified names. Incorrect SQL is a recorded outcome, not a task failure. Missing outputs or judgments, application errors, and evaluator errors leave the report incomplete and fail the final completeness task.
 
-Each evaluation creates an immutable manifest-only ledger experiment linking to the original output experiment because the pinned client has no public experiment-metadata update method. Judgments are written to exact original experiment-run IDs. Ledger experiments are bookkeeping, not application benchmarks. Use the original output experiment ID for reporting and comparisons. A ledger is recovered by Airflow run identity on retry.
+Each evaluation-only run creates an immutable manifest-only ledger experiment linking to the original output experiment because the pinned client has no public experiment-metadata update method. Judgments are written to exact original experiment-run IDs. Ledger experiments are bookkeeping, not application benchmarks. Use the original output experiment ID for reporting and comparisons. A ledger is recovered by Airflow run identity on retry.
 
 Export durable report inputs from Phoenix on your laptop:
 
 ```sh
-uv run --locked python scripts/export_report.py --experiment-id ORIGINAL_EXPERIMENT_ID \
+PHOENIX_BASE_URL=http://localhost:6006 uv run --locked python scripts/export_report.py --experiment-id ORIGINAL_EXPERIMENT_ID \
   --evaluation-config-id CONFIG_HASH --output-dir outputs/baseline
 ```
 
@@ -280,7 +443,7 @@ Use your existing Phoenix troubleshooting skill to inspect a failure's actual tr
 
 ## Remote application routing and tracing
 
-A remote application requires an existing private route or **authenticated HTTPS** endpoint to reach local Phoenix. Never publish this development Compose instance unauthenticated. Configure supported authentication before shared/remote use; provision no tunnel or paid infrastructure automatically. The preflight `--cloud` option checks remote endpoint requirements; it is independent of the local Airflow deployment choice.
+A remote application requires an existing private route or **authenticated HTTPS** endpoint to reach local Phoenix. Never publish this development Compose instance unauthenticated. Configure supported authentication before shared/remote use; provision no tunnel or paid infrastructure automatically. The saved-output preflight checks Phoenix and judge configuration; it does not provision or verify a remote route.
 
 Keep the application's current instrumentation and existing Codex Phoenix skill. Point their respective endpoints to this same instance:
 
