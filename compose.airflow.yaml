@@ -1,0 +1,105 @@
+name: text2sql-airflow
+
+x-airflow: &airflow
+  image: text2sql-airflow:3.3.2
+  build: .
+  restart: unless-stopped
+  env_file:
+    - .env.runtime
+  environment: &airflow-environment
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:?Run make setup first}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?Run make setup first}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:?Run make setup first}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW__API__SECRET_KEY:?Run make setup first}
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/passwords.json
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api:8080/execution/
+    AIRFLOW__API__BASE_URL: http://localhost:8080
+    AIRFLOW__API__WORKERS: "1"
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    PHOENIX_BASE_URL: http://phoenix:6006
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./include:/opt/airflow/include:ro
+    - airflow-logs:/opt/airflow/logs
+  networks:
+    - default
+    - evaluation
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16.11-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run make setup first and use --env-file .env.airflow}
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow
+    restart: "no"
+    command: [airflow, db, migrate]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-api:
+    <<: *airflow
+    environment:
+      <<: *airflow-environment
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Run make setup first}
+    command: [python, scripts/start_airflow_api.py]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v2/monitor/health', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow
+    command: [airflow, scheduler]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8974/health', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *airflow
+    command: [airflow, dag-processor]
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
+
+volumes:
+  airflow-db:
+  airflow-logs:
+
+networks:
+  evaluation:
+    external: true
+    name: text2sql-evaluation

@@ -1,0 +1,27 @@
+name: text2sql-phoenix
+services:
+  phoenix:
+    image: arizephoenix/phoenix:version-21.0.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/phoenix
+      PHOENIX_HOST: 0.0.0.0
+      PHOENIX_ENABLE_AUTH: "false"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+    volumes:
+      - phoenix-data:/mnt/phoenix
+    networks:
+      - evaluation
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6006/healthz', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+volumes:
+  phoenix-data:
+    name: ${PHOENIX_VOLUME_NAME:-text2sql-phoenix-data}
+networks:
+  evaluation:
+    name: text2sql-evaluation

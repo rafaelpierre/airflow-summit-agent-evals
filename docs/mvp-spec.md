@@ -16,18 +16,18 @@ The improvement cycle is human-guided. Application repair happens outside the DA
 ## Existing systems and scope
 
 - Self-host Phoenix OSS using one lightweight Docker Compose service with SQLite and persistent storage. It supplies datasets, experiments, evaluations, and agent traces.
-- An Astro Deployment in the user's Astronomer workspace supplies Airflow. Support local Astro development too.
+- Run Apache Airflow locally. Use Docker Compose with LocalExecutor and a PostgreSQL metadata database; Colima supplies the local Docker engine.
 - The existing application owns agent execution and instrumentation.
 - An existing Codex CLI/skill retrieves Phoenix spans and traces. Do not replace it.
 - Start with 12 examples, one DAG, one repetition, and low concurrency.
-- No custom UI, Kubernetes, automatic application deployment, approval workflow, or autonomous repair agent.
-- Phoenix runs on user-managed compute. Model calls and Astro usage can incur separate charges; keep demonstration volume small.
+- No custom UI, automatic application deployment, approval workflow, or autonomous repair agent. Kubernetes is outside the local demo scope.
+- Phoenix runs on user-managed compute. Model calls can incur charges; keep demonstration volume small.
 
 Inspect the repository and preserve existing work. Build adapters and offline tests while missing integration details are resolved.
 
 ## Runtime and structure
 
-Initialize or reuse an Astro project. Inspect the actual Runtime, Airflow, Python, and provider versions. Pin compatible dependencies; never install a conflicting Airflow version over the Runtime.
+Preserve the existing DAG, adapters, and tests. Inspect the Airflow, Python, and provider versions. Pin compatible dependencies and manage them with uv using pyproject.toml and uv.lock. Use compose.airflow.yaml for Airflow and compose.phoenix.yaml for Phoenix; keep their database volumes separate.
 
 Prefer `arize-phoenix-client`, `apache-airflow-providers-common-ai`, `httpx`, `pydantic`, `jinja2`, and `pytest`. Use a mapped `LLMOperator` if compatible. Otherwise use a Python task with a supported model SDK and document why.
 
@@ -37,10 +37,9 @@ Suggested layout:
 AGENTS.md
 README.md
 docs/mvp-spec.md
-Dockerfile
 compose.phoenix.yaml
-requirements.txt
-packages.txt
+pyproject.toml
+uv.lock
 .env.example
 .gitignore
 dags/text2sql_evaluation.py
@@ -57,17 +56,17 @@ scripts/export_report.py
 tests/
 ```
 
-Ensure imports and packaged templates work inside Astro. Verify SDK calls against installed versions rather than copying unverified signatures.
+Ensure imports and packaged templates work inside the selected local Airflow environment. Verify SDK calls against installed versions rather than copying unverified signatures.
 
 ## Phoenix OSS service
 
-Implement `compose.phoenix.yaml` as a separate Compose project from Astro, with:
+Implement `compose.phoenix.yaml` with a lifecycle independent of Airflow, with:
 
 - One official `arizephoenix/phoenix` image pinned to a verified version or digest compatible with the selected Python client.
 - SQLite as the storage backend. Set `PHOENIX_WORKING_DIR=/mnt/phoenix` and mount a named volume at that path. Do not inherit a PostgreSQL database URL or add a database service.
 - A local default UI/API mapping of `127.0.0.1:6006:6006`, a restart policy, and a readiness check verified against the selected image. Do not assume curl is installed in the container.
 - OTLP over HTTP for application tracing where supported. Verify the `/v1/traces` endpoint and exporter configuration for the pinned version; publish extra ports only if needed.
-- Explicit environment settings, not wholesale forwarding of `.env`. The Phoenix container must not receive `ASTRO_API_TOKEN` or unrelated model credentials.
+- Explicit environment settings, not wholesale forwarding of `.env`. The Phoenix container must not receive unrelated credentials.
 
 Use a single Phoenix instance and low write concurrency for this SQLite demo. Airflow accesses Phoenix over its API, never by mounting/opening the SQLite file. Do not scale multiple Phoenix replicas against the same file.
 
@@ -77,7 +76,7 @@ Verify that a test dataset/experiment survives container recreation with the vol
 
 ## Configuration and authentication
 
-The existing local `.env` contains `ASTRO_API_TOKEN`, a token granting access to the user's Astronomer workspace. Load it for supported Astro CLI/API authentication without displaying it. Keep `.env` gitignored and put only an empty placeholder in `.env.example`. Do not inject this management token into Airflow tasks by default.
+Keep local credentials in gitignored `.env` files and use empty placeholders in `.env.example`. Pass only explicitly required credentials to each service.
 
 Additional configuration:
 
@@ -88,18 +87,17 @@ Additional configuration:
 | Dataset identifier | Existing dataset; configurable field mapping |
 | Agent URL/authentication | Existing API, reachable from the worker |
 | Judge connection | Airflow Connection or supported model SDK secret configuration |
-| Astro workspace/Deployment | Discover through existing token; resolve ambiguity before changes |
 
 Keep a browser-facing Phoenix base URL separate from the worker API address when needed. Do not assume browser, REST, and trace-ingestion URLs are interchangeable. Do not hard-code fabricated Phoenix deep links.
 
 Connectivity must be explicit:
 
 - Host browser/export script/Codex can use `http://localhost:6006` when Phoenix runs locally.
-- Local Astro containers can use `http://phoenix:6006` only after joining a documented shared Docker network with that service alias. A host-gateway address is an alternative only when its binding/routing is verified. Container localhost is not the host.
-- An Astro cloud Deployment cannot use laptop localhost, Docker service DNS, or a local host-gateway address. Require a configured reachable endpoint via an existing private route or authenticated HTTPS tunnel/proxy. Keep Phoenix authentication enabled for remote access and document the required routing/auth setup without silently provisioning a tunnel or paid host.
+- Local Airflow containers can use `http://phoenix:6006` only after joining a documented shared Docker network with that service alias. A host-gateway address is an alternative only when its binding/routing is verified. Container localhost is not the host.
+- A remote application cannot use laptop localhost or local Docker service DNS. Require a configured reachable endpoint via an existing private route or authenticated HTTPS tunnel/proxy. Keep Phoenix authentication enabled for remote access and document the required routing/auth setup without silently provisioning a tunnel or paid host.
 - The application trace exporter must also reach Phoenix from its own environment. Retain existing instrumentation and change only required endpoint/auth settings.
 
-Test connectivity from the actual worker and application environments. If remote routing is not configured, finish local scaffolding and document cloud connectivity as pending rather than claiming a working cloud integration.
+Test connectivity from the actual worker and application environments. If remote routing is not configured, finish local scaffolding and document remote connectivity as pending rather than claiming a working cloud integration.
 
 Expose validated DAG parameters:
 
@@ -231,19 +229,19 @@ Treat empty datasets as validation errors. Avoid zero-denominator scores. Compar
 
 Keep evaluation quality separate from workflow execution status: an incorrect answer is a recorded result, not an infrastructure failure. Missing work or evaluator failure makes the run incomplete. Ensure a successful all-done report task cannot mask an incomplete workflow; use a final check as needed.
 
-## Reports and Astro cloud execution
+## Reports and local execution
 
 Use Jinja autoescaping, no frontend framework, and no external assets. Build summary cards, a comparison table, and expandable example details. No model call is needed to render reports.
 
-Workers may not share disks and local files are temporary. For local use, write to a documented output directory. For cloud use, persist all report inputs in Phoenix and provide:
+Workers may not share disks and local files are temporary. For local use, write to a documented output directory. For portable report export, persist all report inputs in Phoenix and provide:
 
 ```text
-python scripts/export_report.py --experiment-id ID --output-dir outputs/ID
+uv run --locked python scripts/export_report.py --experiment-id ID --output-dir outputs/ID
 ```
 
 Support an evaluation-config selector and optional baseline selector. Use the same rendering code in the DAG and exporter. Record a report manifest/configuration so later export selects the intended results; do not promise byte-identical output if underlying annotations are deliberately changed.
 
-Cloud consolidation renders HTML and logs a summary, but downloading is through the exporter unless existing object storage is configured. Optionally upload to an existing destination; do not provision infrastructure.
+Consolidation renders HTML and logs a summary, but downloading is through the exporter unless existing object storage is configured. Optionally upload to an existing destination; do not provision infrastructure.
 
 ## Codex repair integration
 
@@ -255,19 +253,19 @@ Document a prompt asking the existing Phoenix skill to inspect traces and propos
 
 Provide a preflight script that checks required configuration, Phoenix service readiness, client/server compatibility, worker-to-Phoenix connectivity/dataset access, agent connectivity, and judge configuration without exposing secrets. Do not send paid inference requests merely to check credentials unless requested/configured.
 
-Tests must cover mapping, version selection, configuration snapshots, response validation, structured scoring, run associations, retry/resume, isolated re-evaluation, partial failures, baseline compatibility, and HTML escaping. Parse the DAG in the selected Runtime. Supply explicit offline test doubles, never silent live-mode mocks.
+Tests must cover mapping, version selection, configuration snapshots, response validation, structured scoring, run associations, retry/resume, isolated re-evaluation, partial failures, baseline compatibility, and HTML escaping. Parse the DAG in the selected Airflow environment. Supply explicit offline test doubles, never silent live-mode mocks.
 
 Acceptance criteria:
 
-1. DAG parses and offline tests pass under the selected Astro Runtime.
+1. DAG parses and offline tests pass under the selected local Airflow environment.
 2. A configured live run reads the pinned dataset and records API outputs plus judge evaluations in one Phoenix experiment.
 3. Judge instances are separately visible in Airflow.
 4. Re-evaluation makes zero application calls.
 5. Rubric changes retain distinguishable prior results.
 6. Incomplete runs retain evidence and an incomplete report/status.
-7. Reports from Astro cloud experiments export to the laptop without shared worker storage.
+7. Reports from experiments export to the host without shared worker storage.
 8. README supports baseline -> diagnosis -> candidate -> comparison.
 9. Phoenix datasets and experiments survive container recreation with the named volume retained.
-10. The application sends traces to this Phoenix instance and the existing Codex skill can retrieve them; cloud-worker access is tested or explicitly marked pending.
+10. The application sends traces to this Phoenix instance and the existing Codex skill can retrieve them; worker access is tested or explicitly marked pending.
 
 Finish with implemented files, exact verified commands, test results, live-verification status, and remaining configuration. Do not report a scaffold or mocked run as a completed live integration.

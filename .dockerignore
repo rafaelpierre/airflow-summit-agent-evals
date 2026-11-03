@@ -1,0 +1,12 @@
+.git
+.env*
+.venv*
+.tools
+outputs
+logs
+__pycache__
+**/__pycache__
+.pytest_cache
+.airflow
+airflow.db
+airflow.cfg

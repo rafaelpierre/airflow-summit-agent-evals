@@ -1,1 +1,12 @@
 .env
+.env.*
+!.env.example
+.venv/
+.tools/
+__pycache__/
+.pytest_cache/
+.airflow/
+outputs/
+*.db
+*.db-*
+.venv*/

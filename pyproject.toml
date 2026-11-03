@@ -1,0 +1,28 @@
+[project]
+name = "airflow-summit-agent-evals"
+version = "0.1.0"
+description = "Local Airflow evaluations for a Text2SQL agent, backed by Phoenix"
+readme = "README.md"
+authors = [
+    { name = "rafael", email = "rafael.pierre@gmail.com" }
+]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "apache-airflow[postgres]==3.3.2",
+    "apache-airflow-providers-common-ai==1.0.0",
+    "arize-phoenix-client==3.6.0",
+    "httpx==0.28.1",
+    "jinja2==3.1.6",
+    "pydantic==2.12.3",
+    "pydantic-ai-slim[openai]==2.65.0",
+]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "python-dotenv==1.2.4"]
+
+[project.scripts]
+airflow-summit-agent-evals = "airflow_summit_agent_evals:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"

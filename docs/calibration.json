@@ -1,0 +1,22 @@
+[
+  {
+    "purpose": "Manually labeled synthetic calibration, separate from the user's golden dataset",
+    "question": "Count orders with status paid.",
+    "schema_context": "orders(id INTEGER NOT NULL, status TEXT)",
+    "sql_dialect": "SQLite",
+    "reference_sql": "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+    "candidate_sql": "SELECT COUNT(id) FROM orders WHERE status = 'paid'",
+    "expected_verdict": "correct",
+    "rationale": "id is non-null; COUNT(id) and COUNT(*) count the same filtered rows."
+  },
+  {
+    "purpose": "Manually labeled synthetic calibration",
+    "question": "Count orders placed in January 2025.",
+    "schema_context": "orders(id INTEGER, created_at TEXT ISO-8601 UTC timestamp)",
+    "sql_dialect": "SQLite",
+    "reference_sql": "SELECT COUNT(*) FROM orders WHERE created_at >= '2025-01-01' AND created_at < '2025-02-01'",
+    "candidate_sql": "SELECT COUNT(*) FROM orders WHERE created_at >= '2025-01-01' AND created_at <= '2025-02-01'",
+    "expected_verdict": "incorrect",
+    "rationale": "The inclusive upper bound includes an order exactly at the February boundary."
+  }
+]
