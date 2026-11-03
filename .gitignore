@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.agent.example
 .venv/
 .tools/
 __pycache__/
@@ -10,3 +11,6 @@ outputs/
 *.db
 *.db-*
 .venv*/
+
+# Independent shallow checkout of the application under test.
+/apps/agentic-text2sql/

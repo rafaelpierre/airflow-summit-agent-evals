@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 from dotenv import dotenv_values
 
-ALLOWED = {'PHOENIX_BASE_URL', 'PHOENIX_API_KEY', 'PHOENIX_DATASET_ID', 'AGENT_URL',
-           'AGENT_API_KEY', 'AGENT_HEALTH_URL', 'JUDGE_MODEL', 'AIRFLOW_CONN_JUDGE'}
+ALLOWED = {'PHOENIX_BASE_URL', 'PHOENIX_API_KEY', 'AIRFLOW_CONN_JUDGE',
+           'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL'}
 
 
 def main():
@@ -18,6 +18,9 @@ def main():
     lines = []
     for key in sorted(ALLOWED):
         value = values.get(key, '') or ''
+        if not value and key.startswith(('AIRFLOW_CONN_', 'AIRFLOW_VAR_')):
+            # Empty environment secrets would mask Variables/Connections in the UI.
+            continue
         if '\n' in value or '\r' in value:
             raise ValueError('Multiline environment values are not supported')
         # Compose env files support single quotes and escaped single quotes.

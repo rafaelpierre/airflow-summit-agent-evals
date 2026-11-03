@@ -1,51 +1,42 @@
-import os
-from datetime import datetime, timezone
+"""Evaluate saved Phoenix outputs. This module never executes the application."""
 from .config import normalize, snapshot, digest
-from .models import RunParams
-from .agent_api import call_agent
+from .models import EvaluationParams
 from .phoenix_adapter import annotation_name
 
 
-def prepare(store, params, run_identity, rubric_loader, model, dataset_id=None, fields=None, shared=None):
-    p = RunParams.model_validate(params)
-    source = store.manifest(p.experiment_id) if p.mode == 'evaluate_existing' else None
-    dataset_id = source['dataset_id'] if source else dataset_id
-    if not dataset_id:
-        raise ValueError('PHOENIX_DATASET_ID is required')
+def prepare_evaluation(store, params, run_identity, rubric_loader, model_loader):
+    p = EvaluationParams.model_validate(params)
+    source = store.manifest(p.experiment_id)
+    if source.get("source_experiment_id"):
+        raise ValueError("Select an output experiment, not an evaluation ledger")
     run_key = digest(run_identity)
-    recovered = store.find(dataset_id, run_key)
+    recovered = store.find(source["dataset_id"], run_key)
     if recovered:
-        m = store.manifest(recovered)
-        return {'manifest_id': recovered, 'experiment_id': m.get('source_experiment_id') or recovered}
-    if source:
-        examples = source['examples']
-        config = (snapshot(rubric_loader(), model, examples) if p.new_evaluation_config
-                  else store.select_config(p.experiment_id, p.evaluation_config_id))
-        m = {**source, 'source_experiment_id': p.experiment_id, 'config': config}
+        saved = store.manifest(recovered)
+        if saved.get("source_experiment_id") != p.experiment_id:
+            raise ValueError("Run identity already belongs to another experiment")
+        return {"manifest_id": recovered, "experiment_id": p.experiment_id}
+    # Fetch the exact golden version; never reselect by question or position.
+    golden = normalize(store.dataset(source["dataset_id"], source["dataset_version_id"]))
+    by_id = {e["example_id"]: e for e in golden}
+    selected = source["selected_example_ids"]
+    if not selected or len(set(selected)) != len(selected) or any(i not in by_id for i in selected):
+        raise ValueError("Invalid saved example identities")
+    examples = [by_id[i] for i in sorted(selected)]
+    if examples != sorted(source["examples"], key=lambda e: e["example_id"]):
+        raise ValueError("Saved context differs from pinned golden dataset")
+    configs = store.configurations(p.experiment_id)
+    if p.new_evaluation_config or (not configs and not p.evaluation_config_id):
+        config = snapshot(rubric_loader(), model_loader(), examples)
     else:
-        examples = normalize(store.dataset(dataset_id, p.dataset_version_id), fields, shared)[:p.max_examples]
-        m = {'dataset_id': dataset_id, 'dataset_version_id': p.dataset_version_id, 'examples': examples,
-             'app_revision': p.app_revision, 'config': snapshot(rubric_loader(), model, examples)}
-    m.update(run_key=run_key, mode=p.mode, baseline_experiment_id=p.baseline_experiment_id,
-             baseline_evaluation_config_id=p.baseline_evaluation_config_id,
-             selected_example_ids=[e['example_id'] for e in examples], repetition=1)
+        config = store.select_config(p.experiment_id, p.evaluation_config_id)
+    m = {**source, "source_experiment_id": p.experiment_id, "mode": "evaluate_existing",
+         "run_key": run_key, "config": config, "examples": examples,
+         "selected_example_ids": [e["example_id"] for e in examples],
+         "baseline_experiment_id": p.baseline_experiment_id,
+         "baseline_evaluation_config_id": p.baseline_evaluation_config_id}
     ledger = store.create(m)
-    return {'manifest_id': ledger, 'experiment_id': p.experiment_id or ledger}
-
-
-def execute_application(store, ref, caller=call_agent):
-    m = store.manifest(ref['manifest_id'])
-    if m['mode'] == 'evaluate_existing':
-        return ref
-    runs, _ = store.records(ref['experiment_id'])
-    complete = {r['dataset_example_id'] for r in runs if not r.get('error') and r['output'].get('status') == 'ok'}
-    for example in m['examples']:
-        if example['example_id'] in complete:
-            continue
-        start = datetime.now(timezone.utc)
-        output = caller(ref['experiment_id'], example, m['app_revision'])
-        store.save_run(ref['experiment_id'], example['example_id'], output, start, datetime.now(timezone.utc))
-    return ref
+    return {"manifest_id": ledger, "experiment_id": p.experiment_id}
 
 
 def judge_refs(store, ref):

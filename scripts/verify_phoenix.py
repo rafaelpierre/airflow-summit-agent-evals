@@ -8,7 +8,8 @@ import uuid
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from include.text2sql_eval.phoenix_adapter import PhoenixStore
-from include.text2sql_eval.workflow import prepare, execute_application, judge_refs, persist
+from include.text2sql_eval.application import prepare, execute_application
+from include.text2sql_eval.workflow import judge_refs, persist
 from include.text2sql_eval.reporting import build_report, export
 from include.text2sql_eval.config import digest
 

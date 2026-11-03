@@ -37,13 +37,13 @@ def test_api_seeds_password_before_starting_without_logging(tmp_path, monkeypatc
 def test_runtime_env_only_forwards_allowlisted_keys(tmp_path, monkeypatch):
     source = tmp_path / '.env'
     output = tmp_path / '.env.runtime'
-    source.write_text("UNRELATED_SECRET=never-forward\nAGENT_API_KEY='abc$123'\n")
+    source.write_text("UNRELATED_SECRET=never-forward\nAGENT_API_KEY=never-forward\nAZURE_OPENAI_API_KEY=never-forward\nAIRFLOW_CONN_JUDGE='abc$123'\n")
     for key in write_runtime_env.ALLOWED:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr('sys.argv', ['write_runtime_env', '--source', str(source), '--output', str(output)])
     write_runtime_env.main()
     values = dotenv_values(output, interpolate=False)
-    assert set(values) == write_runtime_env.ALLOWED
-    assert values['AGENT_API_KEY'] == 'abc$123'
+    assert set(values) == write_runtime_env.ALLOWED - {'AIRFLOW_VAR_TEXT2SQL_JUDGE_MODEL'}
+    assert values['AIRFLOW_CONN_JUDGE'] == 'abc$123'
     assert 'never-forward' not in output.read_text()
     assert output.stat().st_mode & 0o777 == 0o600

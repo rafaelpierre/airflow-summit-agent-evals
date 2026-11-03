@@ -5,7 +5,8 @@ import httpx
 import pytest
 from include.text2sql_eval.config import normalize, digest
 from include.text2sql_eval.models import Judgment, RunParams, Response
-from include.text2sql_eval.workflow import prepare, execute_application, judge_refs, persist
+from include.text2sql_eval.application import prepare, execute_application
+from include.text2sql_eval.workflow import prepare_evaluation, judge_refs, persist
 from include.text2sql_eval.reporting import build_report, render
 from include.text2sql_eval.phoenix_adapter import annotation_name
 from include.text2sql_eval.agent_api import call_agent
@@ -57,9 +58,12 @@ class MemoryStore:
             'result': {'label': result['judgment']['verdict']} if 'judgment' in result else None,
             'metadata': {'judgment': result.get('judgment'), 'config': config}})
 
+    def configurations(self, eid):
+        return {digest(m['config']): m['config'] for k, m in self.manifests.items()
+                if (k == eid or m.get('source_experiment_id') == eid) and m.get('config')}
+
     def select_config(self, eid, config_id=None):
-        configs = {digest(m['config']): m['config'] for k, m in self.manifests.items()
-                   if k == eid or m.get('source_experiment_id') == eid}
+        configs = self.configurations(eid)
         if not config_id and len(configs) != 1:
             raise ValueError('Multiple configurations')
         return copy.deepcopy(configs[config_id or next(iter(configs))])
@@ -213,3 +217,32 @@ def test_persistence_failure_resume_does_not_repeat_saved_success():
     calls = []
     execute_application(s, ref, lambda eid, e, rev: calls.append(e['example_id']) or successful())
     assert calls == ['2']  # The unpersisted HTTP request may repeat, as documented.
+
+
+def test_judge_only_first_evaluation_fetches_pinned_dataset_and_never_executes(monkeypatch):
+    s = MemoryStore(); source = new(s); execute_application(s, source, successful)
+    del s.manifests[source['experiment_id']]['config']
+    monkeypatch.setattr('include.text2sql_eval.application.execute_application', lambda *a: pytest.fail('Application executed'))
+    params = {'experiment_id': source['experiment_id']}
+    calls = []
+    def model():
+        calls.append('model')
+        return 'gpt-test-snapshot'
+    ref = prepare_evaluation(s, params, 'judge-only', lambda: RUBRIC, model)
+    assert calls == ['model']
+    assert ref['experiment_id'] == source['experiment_id']
+    assert len(judge_refs(s, ref)) == 2
+    assert prepare_evaluation(s, params, 'judge-only', lambda: pytest.fail('rubric reread'),
+                              lambda: pytest.fail('model reread')) == ref
+    for r in judge_refs(s, ref): judge(s, r)
+    assert build_report(s, source['experiment_id'])['summary']['complete']
+
+
+def test_judge_only_preserves_missing_runs_and_rejects_execution_parameters():
+    s = MemoryStore(); source = new(s)
+    ref = prepare_evaluation(s, {'experiment_id': source['experiment_id']}, 'judge-only',
+                             lambda: pytest.fail('rubric reread'), lambda: pytest.fail('model reread'))
+    assert judge_refs(s, ref) == []
+    assert not build_report(s, source['experiment_id'])['summary']['complete']
+    with pytest.raises(ValueError):
+        prepare_evaluation(s, {**PARAMS, 'experiment_id': source['experiment_id']}, 'bad', lambda: RUBRIC, lambda: 'model')

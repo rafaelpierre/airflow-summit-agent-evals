@@ -20,7 +20,7 @@ class Rubric(Strict):
 
 def snapshot(rubric, model, examples):
     if not model or ':' in model:
-        raise ValueError('JUDGE_MODEL must be an explicit OpenAI model identifier, not a provider prefix')
+        raise ValueError('text2sql_judge_model must be an explicit OpenAI model identifier, not a provider prefix')
     return dict(rubric=Rubric.model_validate(rubric).model_dump(), model=model,
                 evaluator_version='1', output_schema_version='1',
                 context=[{k: e[k] for k in ('example_id', 'schema_context', 'sql_dialect', 'business_rules')} for e in examples])

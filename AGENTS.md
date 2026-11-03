@@ -2,13 +2,13 @@
 
 ## Purpose and source of truth
 
-This project evaluates an existing Text2SQL agent through its REST API. Local Apache Airflow runs the workflow; A self-hosted Phoenix OSS service using Docker Compose and SQLite stores golden datasets, experiments, evaluations, and traces. Codex assists diagnosis and repair outside the DAG.
+This project judges saved Phoenix experiment outputs from an existing Text2SQL CLI. The application runs separately on the host; Airflow must never execute it. Local Apache Airflow runs the workflow; A self-hosted Phoenix OSS service using Docker Compose and SQLite stores golden datasets, experiments, evaluations, and traces. Codex assists diagnosis and repair outside the DAG.
 
 Read `docs/mvp-spec.md` before implementation. Read `README.md` for setup and run instructions. Preserve existing code and configuration. Do not repeatedly scaffold a project that already exists.
 
 ## Architecture and scope
 
-- Maintain one evaluation DAG with separate application execution, LLM judging, persistence, and reporting stages.
+- Maintain one evaluation DAG with dataset/output retrieval, LLM judging, persistence, and reporting stages. Model settings come from Airflow Variables and model credentials from Airflow Connections or supported secrets. Keep application execution outside Airflow.
 - Run one Phoenix OSS service with Docker Compose and SQLite on a persistent named volume. Pin its image version and verify client/server compatibility. Keep its persistent data independent of the Airflow lifecycle.
 - Run local Airflow with Docker Compose and LocalExecutor; Colima supplies the Docker engine on macOS. Pin compatible Airflow, Python, and provider versions. Manage Python dependencies with uv.
 - Prefer the Common AI provider's mapped `LLMOperator` for judging. Verify compatibility; document a Python-task fallback if required.
@@ -36,13 +36,13 @@ Read `docs/mvp-spec.md` before implementation. Read `README.md` for setup and ru
 ## Evaluation invariants
 
 - Pin the Phoenix dataset version and record selected example IDs in stable order.
-- Never send reference SQL or golden answers to the application under test.
+- Never send reference SQL or golden answers to the application under test, including in the separate host runner.
 - Resolve the rubric once per evaluation run. Persist the full effective configuration, canonical hash, actual model identifier, settings, and output-schema version.
 - Retry/resume using the saved configuration. Deliberate rubric changes create a distinct evaluation configuration and preserve prior results.
 - Associate results using explicit Phoenix experiment-run IDs, never question text or positional joins alone.
 - Re-evaluation of saved outputs must make no application requests.
 - Distinguish incorrect SQL, uncertain judgments, API failures, and evaluator failures. Never retry an incorrect answer until it passes.
-- Make experiment creation and result persistence recoverable and retry-safe. Do not claim exactly-once HTTP execution unless the application supports idempotency.
+- Make experiment creation and result persistence recoverable and retry-safe. Do not claim exactly-once application execution unless the application supports idempotency.
 - Do not fabricate trace IDs, scores, model costs, or successful verification.
 - Compare baselines only under compatible datasets, contexts, judge configurations, and example/repetition identities.
 - Preserve incomplete-run status even if report generation succeeds.

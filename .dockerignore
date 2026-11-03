@@ -10,3 +10,5 @@ __pycache__
 .airflow
 airflow.db
 airflow.cfg
+apps/agentic-text2sql
+workshop_agent

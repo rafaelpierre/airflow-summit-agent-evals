@@ -34,6 +34,20 @@ class Judgment(Strict):
         return {'correct': 1, 'incorrect': 0, 'uncertain': None}[self.verdict]
 
 
+class EvaluationParams(Strict):
+    experiment_id: str = Field(min_length=1)
+    evaluation_config_id: str | None = None
+    new_evaluation_config: bool = False
+    baseline_experiment_id: str | None = None
+    baseline_evaluation_config_id: str | None = None
+
+    @model_validator(mode='after')
+    def config_selection(self):
+        if self.new_evaluation_config and self.evaluation_config_id:
+            raise ValueError('Choose a saved configuration OR a new one')
+        return self
+
+
 class RunParams(Strict):
     mode: Literal['new_experiment', 'evaluate_existing'] = 'new_experiment'
     dataset_version_id: str | None = None
